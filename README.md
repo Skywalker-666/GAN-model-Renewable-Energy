@@ -1,132 +1,140 @@
-cWGAN-GP for Load & Price (USEP) Scenarios
+# cWGAN-GP for Load & Price (USEP) Scenarios
 
-This project trains a conditional WGAN-GP to generate joint sequences of [USEP (price), LOAD] conditioned on calendar features and optional exogenous covariates (PV, RP). It also lets you sample scenarios from a trained model and compute import-cost distributions (P10/P50/P90).
+This project implements a **conditional WGAN-GP** to generate **joint sequences** of  
+**[USEP (Uniform Singapore Energy Price), LOAD]** conditioned on calendar features and optional exogenous covariates (**PV, RP**).  
+It also provides tools to **sample scenarios** and **compute import-cost distributions** (P10/P50/P90).
 
-Targets: USEP (SGD/MWh), LOAD (MW)
+---
 
-Conditioning: hour-of-day (sin/cos), day-of-week (sin/cos), month (sin/cos), + optional PV, RP (all standardized)
+## 📊 Problem Statement
 
-Loss/arch: 1D-Conv Generator/Critic with WGAN-GP
+- **Targets**  
+  - `USEP` (SGD/MWh)  
+  - `LOAD` (MW)  
+- **Conditioning variables**  
+  - Hour-of-day (sin/cos)  
+  - Day-of-week (sin/cos)  
+  - Month (sin/cos)  
+  - Optional exogenous: `PV`, `RP`  
+- **Architecture**  
+  - 1D Conv **Generator** & **Critic**  
+  - Loss: **WGAN-GP**  
+- **Outputs**  
+  - Shape: `[n_samples, n_days, 2, seq_len]`  
+  - Example: `100 samples × 7 days × 2 targets × 48 timesteps`  
+- **Cost formula**  
+ImportCost = Σ_t USEP[t] * max(0, LOAD[t] – PV[t])
 
-Output: samples shaped [S, D, 2, T] where S = n_samples, D = n_days, T = seq_len (e.g., 48 per day)
+markdown
+Copy code
 
-Cost formula: Σ_t USEP[t] * max(0, LOAD[t] − PV[t])
+---
 
-A. Data
+## 🗂 Data
 
-We used a CSV with columns:
+We used a CSV with the following columns:
 
-DATE (half-hourly timestamps), PERIOD, USEP, LOAD, PV, RP
+- `DATE` (half-hourly timestamps)  
+- `PERIOD`  
+- `USEP`  
+- `LOAD`  
+- `PV` (photovoltaic generation)  
+- `RP` (reserve/regulation price)  
 
-Example paths:
-
-Windows local:
-
+**Paths:**
+- Local (Windows):
 C:\Users\Dell\Downloads\Real_usep_load_pv_rp.csv
 C:\Users\Dell\Downloads\Predicted_usep_load_pv_rp.csv
 
-
-Server (home = ~):
-
+diff
+Copy code
+- Server (DGX):
 ~/Real_usep_load_pv_rp.csv
 ~/Predicted_usep_load_pv_rp.csv
 
+diff
+Copy code
+- Project folder:
+~/gan_load_price
 
-Project folder: ~/gan_load_price
+yaml
+Copy code
 
-B. Logging in to the server & copying files
-1) SSH into the server
+---
 
-From Windows (PowerShell/CMD):
+## 🚀 Getting Started
 
+### 0. Log in to the server
+```bash
 ssh dgx1570@172.16.203.101
+1. Copy CSVs from Windows to server
+Run these on Windows, not on the server.
 
-2) Copy files from Windows to server (run on Windows)
-
-Use forward slashes in paths; do not run these while you’re already SSH’d into the server.
-
+powershell
+Copy code
 scp "C:/Users/Dell/Downloads/Real_usep_load_pv_rp.csv"      dgx1570@172.16.203.101:~/
 scp "C:/Users/Dell/Downloads/Predicted_usep_load_pv_rp.csv" dgx1570@172.16.203.101:~/
+Pitfall: Running scp "C:/..." on the server fails (ssh: Could not resolve hostname c:).
+Always run from Windows.
 
+⚙️ Environment Setup
+We faced issues with CUDA mismatches and ITTAPI. Here’s what worked:
 
-Pitfall:
-
-Running scp "C:/..." on the server fails: ssh: Could not resolve hostname c:
-Always run scp on your Windows machine.
-
-C:\Users\...\gan_load_price.zip\sample.py isn’t a real path — extract the zip first.
-
-C. Environment setup (CUDA / PyTorch gotchas & fixes)
-
-We saw two common issues:
-
-cuSparse / libnvJitLink mismatch (Torch cu12 wheels vs installed driver)
-
-libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent (missing libittnotify.so from ittapi)
-
-Choose ONE working path
-
-Option A — Conda (GPU cu118)
-
+Option A — Conda GPU (cu118)
+bash
+Copy code
 conda create -y -n gan-energy-clean python=3.11
 conda activate gan-energy-clean
 conda install -y pytorch pytorch-cuda=11.8 -c pytorch -c nvidia
-
-
-Option B — Pip cu118 wheels (this avoided the ITTAPI issue for us)
-
-# remove any conda torch first (don't mix conda/pip builds)
+Option B — Pip GPU (cu118, recommended fix for ITTAPI)
+bash
+Copy code
 conda remove -y pytorch pytorch-cuda torchvision torchaudio
 pip uninstall -y torch torchvision torchaudio
 
-# install official cu118 wheels
 pip install --upgrade --force-reinstall --no-cache-dir \
   torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-
-
-Option C — CPU-only (quick unblock)
-
+Option C — CPU-only (slower)
+bash
+Copy code
 conda create -y -n gan-energy-cpu python=3.11
 conda activate gan-energy-cpu
 conda install -y pytorch cpuonly -c pytorch
+Loader cleanup (helpful in both cases):
 
-
-Loader cleanup (useful in both cases)
-
+bash
+Copy code
 unset LD_PRELOAD
 export LD_LIBRARY_PATH=""
-python -c "import torch; print('torch',torch.__version__,'cuda?',torch.cuda.is_available())"
-
-D. Project layout
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+📂 Project Structure
+pgsql
+Copy code
 gan_load_price/
 ├── train.py
 ├── sample.py
 ├── cost_from_scenarios.py
 ├── model.py
 ├── utils.py
-├── checkpoints/           # best.pt saved here
-└── outputs/               # samples_pt.pkl, costs.csv, cost_summary.json
+├── checkpoints/        # best.pt
+└── outputs/            # samples_pt.pkl, costs.csv, summary.json
+🏋️ Training
+Train for 40 epochs (already done in our case):
 
-E. Training (done once — you already ran 40 epochs)
+bash
+Copy code
 conda activate gan-energy-clean
 cd ~/gan_load_price
 
-python -u train.py \
+python train.py \
   --data_path ~/Real_usep_load_pv_rp.csv \
-  --seq_len 48 --epochs 40 --batch_size 64 | tee -a train.log
+  --seq_len 48 --epochs 40 --batch_size 64
+Checkpoints are saved to checkpoints/best.pt.
 
+Run long jobs with screen:
 
-Checkpoints saved to checkpoints/best.pt with metadata: seq_len, z_dim, hidden, and scalers.
-
-Training log example you saw:
-
-Epoch 034 ... VA-MAE 0.7218
-...
-Epoch 040 ... VA-MAE 0.7373
-
-
-Run long jobs safely with screen
-
+bash
+Copy code
 screen -dmS gantrain bash -lc ' \
   source ~/miniconda3/etc/profile.d/conda.sh && \
   conda activate gan-energy-clean && \
@@ -134,210 +142,115 @@ screen -dmS gantrain bash -lc ' \
   python -u train.py --data_path ~/Real_usep_load_pv_rp.csv --seq_len 48 --epochs 40 --batch_size 64 \
   |& tee -a train.log \
 '
-screen -ls
-screen -r gantrain   # attach; detach with Ctrl+A, D
-screen -S gantrain -X quit
+🔮 Sampling Scenarios
+Important Fix:
 
+Generator input channels must be z_dim + cond_ch (not cond_ch * seq_len).
 
-Pitfall: Do not quote the tilde ("~/Real...") when passing --data_path. Tilde won’t expand inside quotes.
+Condition built from flat covariates → [n_days, F, T].
 
-F. Sampling (no retraining)
-
-Critical architecture note:
-Your checkpoint uses non-stacked conditioning. The Generator in-channels must be z_dim + cond_ch (e.g., 64 + 8 = 72).
-If you time-stack F*T, you’ll get 448 (64 + 8*48) and state_dict loading will fail.
-
-In model.py (correct):
-
-self.init = nn.Conv1d(z_dim + cond_ch, hidden, 3, 1, 1)
-
-
-In sample.py (correct):
-
-Build cond from flat covariate series, take the last n_days * seq_len rows, and reshape to [n_days, F, T].
-
-Do not flatten across time.
-
-Run sampling
-
-conda activate gan-energy-clean
-cd ~/gan_load_price
-
+bash
+Copy code
 python sample.py \
   --checkpoint checkpoints/best.pt \
   --data_path ~/Real_usep_load_pv_rp.csv \
   --seq_len 48 --n_days 7 --n_samples 100
+Expected output:
 
-
-Expected:
-
+bash
+Copy code
 Saved samples to outputs/samples_pt.pkl
+Check:
 
-
-The file is small (a few hundred KB for 100×7×2×48 float32).
-
-Sanity checks
-
-ls -lh outputs/samples_pt.pkl
-
+bash
+Copy code
 python - <<'PY'
 import pickle
 d = pickle.load(open("outputs/samples_pt.pkl","rb"))
-print("keys:", d.keys())
-print("shape:", d["samples"].shape)  # expect (100,7,2,48)
-print("scaled:", d.get("scaled"))    # False if inverse-transformed to real units
+print("shape:", d["samples"].shape)  # (100,7,2,48)
+print("scaled:", d.get("scaled"))    # False if inverse-transformed
 PY
+💰 Cost Computation
+We extended cost_from_scenarios.py to output CSV + JSON.
 
-G. Cost computation (CSV + JSON outputs)
-
-We added CSV/JSON outputs to cost_from_scenarios.py. Example:
-
+bash
+Copy code
 python cost_from_scenarios.py \
   --scenarios outputs/samples_pt.pkl \
   --pv_source file \
   --pv_file ~/Real_usep_load_pv_rp.csv \
   --write_csv --csv_path outputs/costs.csv --per_day \
   --write_summary --summary_path outputs/cost_summary.json
+Console:
 
-
-Console prints:
-
-Total import cost over window | P10, P50, P90: [ ... ]
+sql
+Copy code
+Total import cost over window | P10, P50, P90: [...]
 Wrote per-scenario costs to outputs/costs.csv
 Wrote summary to outputs/cost_summary.json
+outputs/costs.csv: per-scenario totals (and per-day if --per_day)
 
+outputs/cost_summary.json: P10/P50/P90 + metadata
 
-outputs/costs.csv → per-scenario totals + optional per-day columns
+📉 Example Results
+From our last run:
 
-outputs/cost_summary.json → P10/P50/P90 and shape metadata
+pgsql
+Copy code
+Total import cost over window | P10, P50, P90:
+[1,398,904.64   1,517,290.62   1,620,359.93]
+⬇️ Downloading Results
+From Windows:
 
-Variants
+powershell
+Copy code
+scp dgx1570@172.16.203.101:~/gan_load_price/outputs/samples_pt.pkl "C:/Users/Dell/Downloads/"
+scp dgx1570@172.16.203.101:~/gan_load_price/outputs/costs.csv "C:/Users/Dell/Downloads/"
+scp dgx1570@172.16.203.101:~/gan_load_price/outputs/cost_summary.json "C:/Users/Dell/Downloads/"
+scp dgx1570@172.16.203.101:~/gan_load_price/checkpoints/best.pt "C:/Users/Dell/Downloads/"
+Or zip everything on server:
 
-No PV baseline: --pv_source zero
+bash
+Copy code
+cd ~/gan_load_price
+zip -r outputs_bundle.zip outputs/ checkpoints/best.pt
+Then download:
 
-Use predicted PV: --pv_file ~/Predicted_usep_load_pv_rp.csv (must align in cadence & length)
+powershell
+Copy code
+scp dgx1570@172.16.203.101:~/gan_load_price/outputs_bundle.zip "C:/Users/Dell/Downloads/"
+⚠️ Pitfalls & Fixes
+CUDA mismatch / ITTAPI errors
+→ Use pip cu118 wheels; clean env vars with unset LD_PRELOAD.
 
-H. Common pitfalls & fixes (we hit these!)
+State dict size mismatch (72 vs 448)
+→ Ensure Generator input = z_dim + cond_ch. Build cond as [n_days, F, T].
 
-CUDA/ITTAPI loader errors
+Tilde quoting
+→ Do not quote: --data_path ~/file.csv (not "~/file.csv").
 
-Symptom: libtorch_cpu.so: undefined symbol: iJIT_NotifyEvent
+SCP from wrong place
+→ Run scp on Windows, not inside the server. Extract zips first.
 
-Fix: use pip cu118 wheels (Option B), then:
-
-unset LD_PRELOAD
-export LD_LIBRARY_PATH=""
-
-
-cuSparse / libnvJitLink mismatch
-
-Symptom: Torch cu12 wheels with older driver
-
-Fix: install cu118 builds (Option A or B above).
-
-State dict size mismatch: 72 vs 448
-
-Symptom:
-
-size mismatch for init.weight: ... ckpt (128, 72, 3) vs model (128, 448, 3)
-
-
-Cause: time-stacked conditioning in the Generator (or building cond incorrectly)
-
-Fix:
-
-Ensure model.py uses z_dim + cond_ch (not cond_ch * seq_len)
-
-In sample.py, slice from flat covariates, reshape to [n_days, F, T], no flatten
-
-Quick check:
-
-python - <<'PY'
-import torch
-ckpt = torch.load("checkpoints/best.pt", map_location="cpu")
-print("ckpt init.weight:", tuple(ckpt["gen"]["init.weight"].shape))  # (128,72,3)
-print("z_dim:", ckpt["z_dim"], "cond_ch expected:", ckpt["gen"]["init.weight"].shape[1]-ckpt["z_dim"])
-PY
-
-
-Tilde expansion & quoting
-
---data_path "~/file.csv" → tilde won’t expand. Use --data_path ~/file.csv or $HOME/file.csv.
-
-SCP from wrong place / zipped paths
-
-Running scp "C:/..." on the server → ssh: Could not resolve hostname c:
-
-Extract zips; use real paths (e.g., C:/Users/Dell/Downloads/gan_load_price/sample.py) and run scp on Windows.
-
-Sampling units
-
-Make sure sample.py inverse-transforms outputs using checkpoint y_scaler_mean/scale so USEP/LOAD are in real units.
-
-I. Golden path (no retraining)
-# 1) Activate env
+🎯 Golden Path (no retraining)
+bash
+Copy code
 conda activate gan-energy-clean
 cd ~/gan_load_price
 
-# 2) Sampling (real units; quick)
+# 1. Sample
 python sample.py \
   --checkpoint checkpoints/best.pt \
   --data_path ~/Real_usep_load_pv_rp.csv \
   --seq_len 48 --n_days 7 --n_samples 100
 
-# 3) Cost distribution + artifacts
+# 2. Cost analysis
 python cost_from_scenarios.py \
   --scenarios outputs/samples_pt.pkl \
   --pv_source file \
   --pv_file ~/Real_usep_load_pv_rp.csv \
   --write_csv --csv_path outputs/costs.csv --per_day \
   --write_summary --summary_path outputs/cost_summary.json
-
-J. Downloading results to your PC
-
-From Windows:
-
-# Scenarios
-scp dgx1570@172.16.203.101:~/gan_load_price/outputs/samples_pt.pkl "C:/Users/Dell/Downloads/"
-
-# Costs + summary
-scp dgx1570@172.16.203.101:~/gan_load_price/outputs/costs.csv "C:/Users/Dell/Downloads/"
-scp dgx1570@172.16.203.101:~/gan_load_price/outputs/cost_summary.json "C:/Users/Dell/Downloads/"
-
-# (Optional) Checkpoint
-scp dgx1570@172.16.203.101:~/gan_load_price/checkpoints/best.pt "C:/Users/Dell/Downloads/"
-
-
-Bundle & grab in one go
-
-# on server
-cd ~/gan_load_price
-zip -r outputs_bundle.zip outputs/ checkpoints/best.pt
-
-# on Windows
-scp dgx1570@172.16.203.101:~/gan_load_price/outputs_bundle.zip "C:/Users/Dell/Downloads/"
-
-
-GUI option: WinSCP (SFTP) → Host 172.16.203.101, user dgx1570.
-
-K. Performance notes
-
-Sampling is fast: n_samples × n_days forward passes of a small 1D-Conv net.
-Typical runtime: a few seconds on CPU; ~1–3 s on GPU.
-
-File sizes stay small (hundreds of KB to a few MB).
-
-L. Troubleshooting checklist
-
-torch.cuda.is_available() is False? → Sampling still fine on CPU; training slower.
-
-KeyError: "y_scaler_mean" when sampling? → You’re using an older checkpoint; re-train or skip inverse-transform (costs would be incorrect).
-
-PV alignment errors? → Ensure PV column exists; last n_days*seq_len rows match the sampled window.
-
-“No such file or directory” → Check paths, avoid quoting ~.
-
-M. Credits & License
-
-This minimal framework is adapted for quick, reproducible scenario generation and cost analysis on half-hourly Singapore USEP data with optional PV/RP covariates. Use responsibly and validate against your business metrics./critic for stability and speed.
-- Use the **mean/quantiles** of samples for point forecasts or risk analysis (P50, P90, etc.).
+📌 License & Credits
+Minimal framework adapted for Singapore USEP data scenario generation and cost analysis.
+Use responsibly and validate against your metrics.
