@@ -1,122 +1,185 @@
-import os, argparse, math
+# train.py
+import os, argparse, pickle
 import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from tqdm import tqdm
+import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-from utils import make_time_features, build_sequences, train_val_split
+from utils import (
+    set_seed, read_energy_csv, make_daily_tensors, RobustScaler1D,
+    log1p_signed, expm1_signed, build_time_condition, stack_condition_with_exogenous,
+    ema_update
+)
 from model import Generator, Critic
 
-def gradient_penalty(critic, real, fake, cond, device):
-    alpha = torch.rand(real.size(0), 1, 1, device=device)
-    inter = alpha * real + (1-alpha) * fake
-    inter.requires_grad_(True)
-    score = critic(inter, cond)
-    grad = torch.autograd.grad(outputs=score.sum(),
-                               inputs=inter,
-                               create_graph=True)[0]
-    gp = ((grad.view(grad.size(0), -1).norm(2, dim=1) - 1.0)**2).mean()
-    return gp
+# -----------------------------
+# Dataset
+# -----------------------------
+class DayDataset(Dataset):
+    def __init__(self, dates, times, usep, load, pv, rp, seq_len=48):
+        self.dates, self.times = dates, times
+        self.usep, self.load = usep, load
+        self.pv, self.rp = pv, rp
+        self.seq_len = seq_len
 
+    def __len__(self):
+        return len(self.dates)
+
+    def __getitem__(self, i):
+        T = self.seq_len
+        # targets
+        y = np.stack([self.usep[i], self.load[i]], axis=0)  # [2, T]
+        # build conditioning [F, T]
+        cond_t = build_time_condition(self.times[i])        # [6, T]
+        cond = stack_condition_with_exogenous(cond_t, pv=self.pv[i], rp=(self.rp[i] if self.rp is not None else None))
+        return (
+            torch.from_numpy(y).float(),       # [2,T]
+            torch.from_numpy(cond).float(),    # [F,T]
+            str(self.dates[i].date())
+        )
+
+# -----------------------------
+# Training loop
+# -----------------------------
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("outputs", exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+    set_seed(args.seed)
 
-    df = pd.read_csv(args.data_path)
-    df = make_time_features(df, "DATE")
+    df = read_energy_csv(args.data_path)
+    dates, times, y_usep, y_load, x_pv, x_rp = make_daily_tensors(df, seq_len=args.seq_len, use_rp=args.use_rp)
+    assert len(dates) > 0, "No complete days found."
 
-    X_c, Y, y_scaler, c_scaler, cov_cols = build_sequences(df, seq_len=args.seq_len, use_covariates=True)
-    (Xc_tr, Y_tr), (Xc_va, Y_va) = train_val_split(X_c, Y, val_ratio=0.1)
+    # Train/Val split by last val_days
+    if args.val_days > 0:
+        train_idx = np.arange(0, len(dates) - args.val_days)
+        val_idx   = np.arange(len(dates) - args.val_days, len(dates))
+    else:
+        train_idx = np.arange(len(dates)); val_idx = np.array([], dtype=int)
 
-    # to torch: [N,T,C] -> [N,C,T]
-    def to_ch_first(a): return torch.from_numpy(np.swapaxes(a,1,2)).float()
-    tr_set = TensorDataset(to_ch_first(Xc_tr), to_ch_first(Y_tr))
-    va_set = TensorDataset(to_ch_first(Xc_va), to_ch_first(Y_va))
-    tr_loader = DataLoader(tr_set, batch_size=args.batch_size, shuffle=True, drop_last=True)
-    va_loader = DataLoader(va_set, batch_size=args.batch_size, shuffle=False, drop_last=False)
+    # Fit scalers (on train only)
+    usep_scaler = RobustScaler1D().fit(log1p_signed(y_usep[train_idx]))
+    load_scaler = RobustScaler1D().fit(y_load[train_idx])
 
-    cond_ch = Xc_tr.shape[-1]
-    gen = Generator(z_dim=args.z_dim, cond_ch=cond_ch, out_ch=2, hidden=args.hidden).to(device)
-    cri = Critic(in_ch=2, cond_ch=cond_ch, hidden=args.hidden).to(device)
+    # Transform
+    y_usep_t = usep_scaler.transform(log1p_signed(y_usep))
+    y_load_t = load_scaler.transform(y_load)
 
-    opt_g = torch.optim.Adam(gen.parameters(), lr=args.lr_g, betas=tuple(args.betas))
-    opt_d = torch.optim.Adam(cri.parameters(), lr=args.lr_d, betas=tuple(args.betas))
+    # Datasets
+    train_ds = DayDataset(dates[train_idx], [times[i] for i in train_idx],
+                          y_usep_t[train_idx], y_load_t[train_idx],
+                          x_pv[train_idx], (x_rp[train_idx] if x_rp is not None else None),
+                          seq_len=args.seq_len)
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, drop_last=True)
 
-    best_va = 1e9
-    for epoch in range(1, args.epochs+1):
-        gen.train(); cri.train()
-        d_losses, g_losses = [], []
+    val_ds = None
+    if len(val_idx):
+        val_ds = DayDataset(dates[val_idx], [times[i] for i in val_idx],
+                            y_usep_t[val_idx], y_load_t[val_idx],
+                            x_pv[val_idx], (x_rp[val_idx] if x_rp is not None else None),
+                            seq_len=args.seq_len)
 
-        for xc, y in tr_loader:
-            xc = xc.to(device)  # [B, Cc, T]
-            y  = y.to(device)   # [B, 2,  T]
-            # multiple critic steps
-            for _ in range(args.critic_steps):
-                z = torch.randn(y.size(0), args.z_dim, y.size(-1), device=device)
-                y_fake = gen(z, xc).detach()
-                d_real = cri(y, xc).mean()
-                d_fake = cri(y_fake, xc).mean()
-                gp = gradient_penalty(cri, y, y_fake, xc, device) * args.gp_lambda
-                d_loss = -(d_real - d_fake) + gp
+    # Model
+    cond_ch = 6 + (1 if args.use_pv else 0) + (1 if args.use_rp else 0)
+    G = Generator(z_dim=args.z_dim, cond_ch=cond_ch, hidden=args.hidden, out_ch=2).to(device)
+    D = Critic(cond_ch=cond_ch, in_ch=2, hidden=args.hidden).to(device)
+    G_ema = Generator(z_dim=args.z_dim, cond_ch=cond_ch, hidden=args.hidden, out_ch=2).to(device)
+    G_ema.load_state_dict(G.state_dict())
 
-                opt_d.zero_grad(set_to_none=True)
-                d_loss.backward()
-                opt_d.step()
+    # Optims (TTUR)
+    optG = torch.optim.Adam(G.parameters(), lr=args.lrG, betas=(0.0, 0.9))
+    optD = torch.optim.Adam(D.parameters(), lr=args.lrD, betas=(0.0, 0.9))
 
-            # generator step
-            z = torch.randn(y.size(0), args.z_dim, y.size(-1), device=device)
-            y_fake = gen(z, xc)
-            g_loss = -cri(y_fake, xc).mean()
+    huber = nn.SmoothL1Loss()
 
-            opt_g.zero_grad(set_to_none=True)
-            g_loss.backward()
-            opt_g.step()
+    step = 0
+    for epoch in range(1, args.epochs + 1):
+        G.train(); D.train()
+        for (y_real, cond, _) in train_dl:
+            y_real = y_real.to(device)               # [B,2,T]
+            cond   = cond.to(device)                 # [B,F,T]
+            B, _, T = y_real.shape
 
-            d_losses.append(d_loss.item()); g_losses.append(g_loss.item())
+            # ----------------- Critic updates -----------------
+            for _ in range(args.c_iters):
+                z = torch.randn(B, args.z_dim, T, device=device)
+                with torch.no_grad():
+                    y_fake = G(z, cond)
+                d_real = D(y_real, cond).mean()
+                d_fake = D(y_fake, cond).mean()
+                wd = d_real - d_fake
 
-        # simple val score: L1 between real and a single sample (proxy for monitoring)
-        gen.eval()
-        with torch.no_grad():
-            mae_list = []
-            for xc, y in va_loader:
-                xc = xc.to(device); y = y.to(device)
-                z = torch.randn(y.size(0), args.z_dim, y.size(-1), device=device)
-                y_hat = gen(z, xc)
-                mae = (y_hat - y).abs().mean().item()
-                mae_list.append(mae)
-            va_mae = float(np.mean(mae_list))
+                # Gradient Penalty
+                eps = torch.rand(B, 1, 1, device=device)
+                x_hat = eps * y_real + (1 - eps) * y_fake
+                x_hat.requires_grad_(True)
+                d_hat = D(x_hat, cond).sum()
+                g = torch.autograd.grad(d_hat, x_hat, create_graph=True)[0]
+                gp = ((g.flatten(1).norm(2, dim=1) - 1) ** 2).mean()
 
-        print(f"Epoch {epoch:03d} | D {np.mean(d_losses):.4f} | G {np.mean(g_losses):.4f} | VA-MAE {va_mae:.4f}")
-        if va_mae < best_va:
-            best_va = va_mae
-            torch.save({
-                "gen": gen.state_dict(),
-                "cri": cri.state_dict(),
-                "y_scaler_mean": y_scaler.mean_.tolist(),
-                "y_scaler_scale": y_scaler.scale_.tolist(),
-                "c_scaler_mean": y_scaler.mean_.tolist(),
-                "c_scaler_scale": y_scaler.scale_.tolist(),
-                "cov_cols": cov_cols,
-                "seq_len": args.seq_len,
-                "z_dim": args.z_dim,
-                "hidden": args.hidden
-            }, "checkpoints/best.pt")
+                loss_D = -wd + args.gp_lambda * gp
+                optD.zero_grad(set_to_none=True)
+                loss_D.backward()
+                optD.step()
+
+            # ----------------- Generator update -----------------
+            z = torch.randn(B, args.z_dim, T, device=device)
+            y_fake = G(z, cond)
+            g_adv = -D(y_fake, cond).mean()
+
+            # small anchor with tiny noise
+            z_eps = 0.1 * torch.randn(B, args.z_dim, T, device=device)
+            y_anchor = G(z_eps, cond)
+            loss_anchor = huber(y_anchor, y_real)
+
+            loss_G = g_adv + args.anchor * loss_anchor
+            optG.zero_grad(set_to_none=True)
+            loss_G.backward()
+            optG.step()
+
+            ema_update(G_ema, G, decay=args.ema)
+
+            step += 1
+
+        print(f"[Epoch {epoch:03d}] D: {loss_D.item():.4f} | G: {loss_G.item():.4f} | wd: {wd.item():.4f} | gp:{gp.item():.3f}")
+
+    # Save checkpoint (includes scalers)
+    os.makedirs(args.outdir, exist_ok=True)
+    ckpt = {
+        "G": G.state_dict(),
+        "G_ema": G_ema.state_dict(),
+        "D": D.state_dict(),
+        "cfg": vars(args),
+        "usep_scaler": usep_scaler.to_dict(),
+        "load_scaler": load_scaler.to_dict(),
+    }
+    torch.save(ckpt, os.path.join(args.outdir, "ckpt_last.pt"))
+    print(f"[OK] Saved to {os.path.join(args.outdir, 'ckpt_last.pt')}")
+
+# -----------------------------
+# CLI
+# -----------------------------
+def cli():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_path", required=True)
+    ap.add_argument("--outdir", default="checkpoints")
+    ap.add_argument("--seq_len", type=int, default=48)
+    ap.add_argument("--val_days", type=int, default=0)
+    ap.add_argument("--use_pv", action="store_true", default=True)
+    ap.add_argument("--use_rp", action="store_true", default=True)
+
+    ap.add_argument("--z_dim", type=int, default=16)
+    ap.add_argument("--hidden", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--lrG", type=float, default=1e-4)
+    ap.add_argument("--lrD", type=float, default=2e-4)
+    ap.add_argument("--c_iters", type=int, default=2)
+    ap.add_argument("--gp_lambda", type=float, default=10.0)
+    ap.add_argument("--anchor", type=float, default=0.05)
+    ap.add_argument("--ema", type=float, default=0.999)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cpu", action="store_true")
+    args = ap.parse_args()
+    train(args)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_path", type=str, required=True)
-    p.add_argument("--seq_len", type=int, default=48)
-    p.add_argument("--epochs", type=int, default=40)
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--lr_g", type=float, default=1e-4)
-    p.add_argument("--lr_d", type=float, default=4e-4)
-    p.add_argument("--betas", type=float, nargs=2, default=[0.0, 0.9])
-    p.add_argument("--gp_lambda", type=float, default=10.0)
-    p.add_argument("--critic_steps", type=int, default=5)
-    p.add_argument("--z_dim", type=int, default=64)
-    p.add_argument("--hidden", type=int, default=128)
-    args = p.parse_args()
-    train(args)
+    cli()

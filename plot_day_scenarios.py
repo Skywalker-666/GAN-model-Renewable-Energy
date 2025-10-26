@@ -1,157 +1,129 @@
-import argparse, os, pickle
+#!/usr/bin/env python3
+"""
+Overlay ALL scenarios vs. Actual for a given day range.
+Pure visualization (no selection, no Top-K).
+
+Inputs
+------
+--samples : same format as select_and_plot_topK.py
+--real    : CSV with DATE, USEP, LOAD (PERIOD optional)
+--start   : inclusive date (YYYY-MM-DD)
+--end     : inclusive date (YYYY-MM-DD)
+--outdir  : directory for figures
+--dpi     : figure dpi
+--thin    : optional int to thin scenario lines (plot every 'thin'-th scenario)
+
+Produces
+--------
+One PNG per day for USEP and LOAD (two files/day), with all scenario lines and actual.
+"""
+
+import os, argparse, pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter, HourLocator
 
-def load_last_days(df, date_col, days, seq_len):
-    """Return the last `days` calendar days as a (dates_list, ts_index, day2slice) mapping."""
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.sort_values(date_col)
-    # extract unique days (date part only) and take the last `days`
-    df["__day__"] = df[date_col].dt.date
-    uniq_days = df["__day__"].drop_duplicates().to_list()
-    if len(uniq_days) < days:
-        raise ValueError(f"CSV has only {len(uniq_days)} unique days; need {days}.")
-    selected_days = uniq_days[-days:]
-    # Build a day->index mapping and slices for 48 steps each
-    day_slices = {}
-    ts_index = {}
-    for d in selected_days:
-        mask = df["__day__"] == d
-        day_df = df.loc[mask].sort_values(date_col)
-        if len(day_df) < seq_len:
-            raise ValueError(f"Day {d} has only {len(day_df)} rows; need {seq_len}.")
-        # take the last seq_len points of that day in case of more rows
-        day_df = day_df.iloc[-seq_len:]
-        ts_index[d] = day_df[date_col].values
-        day_slices[d] = day_df.index
-    return selected_days, ts_index, day_slices
+plt.rcParams["figure.figsize"] = (14, 4)
+plt.rcParams["axes.grid"] = True
 
-def main(args):
-    os.makedirs("outputs/figs", exist_ok=True)
+def load_samples(path):
+    if path.endswith(".npz"):
+        z = np.load(path, allow_pickle=True)
+        return {
+            "dates": z["dates"],
+            "time": z["time"],
+            "usep_samples": z["usep_samples"],
+            "load_samples": z["load_samples"],
+        }
+    with open(path, "rb") as f:
+        z = pickle.load(f)
+        return z
 
-    # --- Load scenarios ---
-    with open(args.scenarios, "rb") as f:
-        data = pickle.load(f)
-    samples = data["samples"]                      # [S, D, 2, T]
-    S, D, C, T = samples.shape
-    assert C == 2, "Expected channels [USEP, LOAD]"
-    USEP = samples[:, :, 0, :]                     # [S, D, T]
-    LOAD = samples[:, :, 1, :]                     # [S, D, T]
+def normalize_time_axis(T):
+    ticks = np.arange(T)
+    labels = []
+    for t in ticks:
+        h = (t // 2) % 24
+        m = (t % 2) * 30
+        labels.append(f"{h:02d}:{m:02d}")
+    return ticks, labels
 
-    # --- Load real CSV and align to last D days (or a specific date) ---
-    df = pd.read_csv(args.csv_path, parse_dates=[args.date_col])
-    days, ts_index, day_slices = load_last_days(df, args.date_col, D, T)
+def read_real_csv(path):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().upper() for c in df.columns]
+    if "DATE" in df.columns:
+        df["DATE"] = pd.to_datetime(df["DATE"])
+    return df
 
-    # If user provided a specific date, map it to the day index among the last D days
-    if args.date:
-        target = pd.to_datetime(args.date).date()
-        if target not in days:
-            raise SystemExit(f"--date {args.date} not found within the last {D} day(s): {days}")
-        day_idx = days.index(target)
-    else:
-        day_idx = D - 1  # by default, use the most recent day among the last D
+def extract_day_series(df, the_date, T):
+    day = df[df["DATE"] == pd.to_datetime(the_date)].sort_index()
+    if "USEP" in day and "LOAD" in day and len(day) >= T:
+        return day["USEP"].values[:T], day["LOAD"].values[:T]
+    u = float(day["USEP"].iloc[0]); l = float(day["LOAD"].iloc[0])
+    return np.repeat(u, T), np.repeat(l, T)
 
-    # Build actual series (vectors of len T) for the chosen day
-    the_day = days[day_idx]
-    rows = day_slices[the_day]
-    # ensure correct order (in case index is not sorted)
-    day_df = df.loc[rows].sort_values(args.date_col)
-    ts = pd.to_datetime(day_df[args.date_col].values)
-    actual_price = day_df[args.usep_col].values
-    actual_load  = day_df[args.load_col].values
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--samples", required=True)
+    ap.add_argument("--real", required=True)
+    ap.add_argument("--start", required=False)
+    ap.add_argument("--end", required=False)
+    ap.add_argument("--outdir", default="figs_scenarios")
+    ap.add_argument("--dpi", type=int, default=140)
+    ap.add_argument("--thin", type=int, default=1)
+    args = ap.parse_args()
 
-    # Sanity
-    if len(actual_price) != T or len(actual_load) != T:
-        raise ValueError(f"Day {the_day} has len {len(actual_price)}, expected {T}.")
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # --- PLOT HELPERS ---
-    def format_time_axis(ax):
-        ax.xaxis.set_major_locator(HourLocator(interval=2))
-        ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d\n%H:%M"))
-        plt.setp(ax.get_xticklabels(), rotation=0, ha="center")
+    S = load_samples(args.samples)
+    dates = pd.to_datetime(S["dates"])
+    usep_samps = np.asarray(S["usep_samples"])   # [D,S,T]
+    load_samps = np.asarray(S["load_samples"])   # [D,S,T]
+    D, S_, T = usep_samps.shape
+    xticks, xlabels = normalize_time_axis(T)
+    df_real = read_real_csv(args.real)
 
-    # === A) OVERLAY: ALL SCENARIOS vs ACTUAL (PRICE) ===
-    fig, ax = plt.subplots(figsize=(14,6))
-    for s in range(S):
-        ax.plot(ts, USEP[s, day_idx, :], alpha=0.25)
-    ax.plot(ts, actual_price, linewidth=2.5, label="Actual USEP")
-    ax.set_title(f"USEP — All {S} scenarios vs Actual | Day {the_day}")
-    ax.set_xlabel("Date Time")
-    ax.set_ylabel("USEP (SGD/MWh)")
-    ax.legend()
-    format_time_axis(ax)
-    fig.tight_layout()
-    out_p_all = f"outputs/figs/price_all_scenarios_day{day_idx}.png"
-    fig.savefig(out_p_all, dpi=150)
-    plt.close(fig)
+    # filter date range
+    if args.start:
+        mask = dates >= pd.to_datetime(args.start)
+        dates = dates[mask]; usep_samps = usep_samps[mask]; load_samps = load_samps[mask]
+    if args.end:
+        mask = dates <= pd.to_datetime(args.end)
+        dates = dates[mask]; usep_samps = usep_samps[mask]; load_samps = load_samps[mask]
 
-    # === B) OVERLAY: ALL SCENARIOS vs ACTUAL (LOAD) ===
-    fig, ax = plt.subplots(figsize=(14,6))
-    for s in range(S):
-        ax.plot(ts, LOAD[s, day_idx, :], alpha=0.25)
-    ax.plot(ts, actual_load, linewidth=2.5, label="Actual LOAD")
-    ax.set_title(f"LOAD — All {S} scenarios vs Actual | Day {the_day}")
-    ax.set_xlabel("Date Time")
-    ax.set_ylabel("LOAD (MW)")
-    ax.legend()
-    format_time_axis(ax)
-    fig.tight_layout()
-    out_l_all = f"outputs/figs/load_all_scenarios_day{day_idx}.png"
-    fig.savefig(out_l_all, dpi=150)
-    plt.close(fig)
+    for d_idx, day in enumerate(dates):
+        usep_day = usep_samps[d_idx]   # [S,T]
+        load_day = load_samps[d_idx]   # [S,T]
+        usep_real, load_real = extract_day_series(df_real, day, T)
 
-    # === C) PER-SCENARIO PANELS vs ACTUAL ===
-    max_panels = min(args.max_panels, S)
-
-    for s in range(max_panels):
-        # Price
-        fig, ax = plt.subplots(figsize=(14,6))
-        ax.plot(ts, actual_price, linewidth=2.5, label="Actual USEP")
-        ax.plot(ts, USEP[s, day_idx, :], linewidth=1.5, label=f"Scenario {s}")
-        ax.set_title(f"USEP — Actual vs Scenario {s} | Day {the_day}")
-        ax.set_xlabel("Date Time")
+        # --- USEP
+        fig, ax = plt.subplots()
+        # plot scenarios (thinned)
+        for s in range(0, usep_day.shape[0], args.thin):
+            ax.plot(xticks, usep_day[s], alpha=0.3, linewidth=1)
+        ax.plot(xticks, usep_real, color="k", lw=3, label="Actual USEP")
+        ax.set_title(f"USEP — Actual vs. All Scenarios | {day.date()}")
         ax.set_ylabel("USEP (SGD/MWh)")
-        ax.legend()
-        format_time_axis(ax)
+        ax.set_xticks(xticks[::4]); ax.set_xticklabels(xlabels[::4])
+        ax.legend(loc="upper left")
         fig.tight_layout()
-        fig.savefig(f"outputs/figs/price_vs_scenario_{s}_day{day_idx}.png", dpi=150)
+        fig.savefig(os.path.join(args.outdir, f"usep_all_{day.date()}.png"), dpi=args.dpi)
         plt.close(fig)
 
-        # Load
-        fig, ax = plt.subplots(figsize=(14,6))
-        ax.plot(ts, actual_load, linewidth=2.5, label="Actual LOAD")
-        ax.plot(ts, LOAD[s, day_idx, :], linewidth=1.5, label=f"Scenario {s}")
-        ax.set_title(f"LOAD — Actual vs Scenario {s} | Day {the_day}")
-        ax.set_xlabel("Date Time")
+        # --- LOAD
+        fig, ax = plt.subplots()
+        for s in range(0, load_day.shape[0], args.thin):
+            ax.plot(xticks, load_day[s], alpha=0.3, linewidth=1)
+        ax.plot(xticks, load_real, color="k", lw=3, label="Actual LOAD")
+        ax.set_title(f"LOAD — Actual vs. All Scenarios | {day.date()}")
         ax.set_ylabel("LOAD (MW)")
-        ax.legend()
-        format_time_axis(ax)
+        ax.set_xticks(xticks[::4]); ax.set_xticklabels(xlabels[::4])
+        ax.legend(loc="upper left")
         fig.tight_layout()
-        fig.savefig(f"outputs/figs/load_vs_scenario_{s}_day{day_idx}.png", dpi=150)
+        fig.savefig(os.path.join(args.outdir, f"load_all_{day.date()}.png"), dpi=args.dpi)
         plt.close(fig)
 
-    print("Saved:")
-    print(" ", out_p_all)
-    print(" ", out_l_all)
-    print(f" Per-scenario panels (first {max_panels}) in outputs/figs/")
-    print(" Done.")
-    
+    print(f"[OK] Plots written to {args.outdir}")
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--scenarios", type=str, default="outputs/samples_pt.pkl")
-    p.add_argument("--csv_path", type=str, default="~/Real_usep_load_pv_rp.csv")
-    p.add_argument("--date", type=str, default=None, help="YYYY-MM-DD (must be within last D days used for sampling)")
-    p.add_argument("--usep_col", type=str, default="USEP")
-    p.add_argument("--load_col", type=str, default="LOAD")
-    p.add_argument("--date_col", type=str, default="DATE")
-    p.add_argument("--max_panels", type=int, default=5, help="how many per-scenario panels to save")
-    args = p.parse_args()
-    # expand ~ in paths
-    args.csv_path = os.path.expanduser(args.csv_path)
-    args.scenarios = os.path.expanduser(args.scenarios)
-    main(args)
-
+    main()

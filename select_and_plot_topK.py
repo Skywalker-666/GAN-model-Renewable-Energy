@@ -1,108 +1,163 @@
-import os, argparse, pickle, numpy as np, pandas as pd
+#!/usr/bin/env python3
+"""
+Honest evaluation & plotting for USEP/LOAD scenario forecasts.
+- No post-hoc Top-K selection (no leakage).
+- Plots median and P10–P90 bands vs. Actual.
+- Reports Energy Score, Coverage, and RMSE(median).
+
+Inputs
+------
+--samples  : path to a npz/pickle with arrays:
+             'dates' [D], 'time' [T], 'usep_samples' [D,S,T], 'load_samples' [D,S,T]
+--real     : CSV with columns: DATE, PERIOD(optional), USEP, LOAD
+--outdir   : directory for figures
+--dpi      : figure dpi (default 140)
+
+Notes
+-----
+- Channels order in samples: usep first, load second (kept separate here for clarity).
+- DATE should parse to pandas datetime; PERIOD optional (half-hourly index).
+"""
+
+import os, argparse, pickle
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.dates import DateFormatter, HourLocator
+from datetime import datetime
 
-def load_last_days(df, date_col, days, seq_len):
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.sort_values(date_col)
-    df["__day__"] = df[date_col].dt.date
-    uniq = df["__day__"].drop_duplicates().to_list()
-    selected = uniq[-days:]
-    day_ts, day_vals = {}, {}
-    for d in selected:
-        sub = df[df["__day__"]==d].sort_values(date_col).iloc[-seq_len:]
-        if len(sub)!=seq_len: continue
-        day_ts[d] = pd.to_datetime(sub[date_col].values)
-        day_vals[d] = sub
-    return selected, day_ts, day_vals
+plt.rcParams["figure.figsize"] = (14, 4)
+plt.rcParams["axes.grid"] = True
 
-def rmse(a,b): return np.sqrt(np.mean((a-b)**2))
-def rank_scenarios(actual, scenarios):
-    scores = np.array([rmse(actual, scenarios[s]) for s in range(scenarios.shape[0])])
-    idx = np.argsort(scores)
-    return idx, scores
+def energy_score(samples, y):
+    # samples: [S,T], y: [T]
+    s = np.asarray(samples)
+    y = np.asarray(y)
+    term1 = np.mean(np.sqrt(np.sum((s - y[None, :]) ** 2, axis=1)))
+    diffs = s[:, None, :] - s[None, :, :]
+    term2 = 0.5 * np.mean(np.sqrt(np.sum(diffs ** 2, axis=2)))
+    return term1 - term2
 
-def format_time_axis(ax):
-    ax.xaxis.set_major_locator(HourLocator(interval=2))
-    ax.xaxis.set_major_formatter(DateFormatter("%H:%M"))
+def load_samples(path):
+    if path.endswith(".npz"):
+        z = np.load(path, allow_pickle=True)
+        return {
+            "dates": z["dates"],
+            "time": z["time"],
+            "usep_samples": z["usep_samples"],
+            "load_samples": z["load_samples"],
+        }
+    with open(path, "rb") as f:
+        z = pickle.load(f)
+        return z
 
-def main(args):
-    os.makedirs("outputs/figs", exist_ok=True)
-    with open(args.scenarios, "rb") as f: d = pickle.load(f)
-    S,D,C,T = d["samples"].shape
-    USEP, LOAD = d["samples"][:,:,0,:], d["samples"][:,:,1,:]
+def normalize_time_axis(time_like):
+    """Make a pretty x-axis (e.g., 48 half-hours -> '00:00'..)."""
+    if isinstance(time_like, np.ndarray) and np.issubdtype(time_like.dtype, np.number):
+        T = len(time_like)
+        ticks = np.arange(T)
+        labels = []
+        for t in ticks:
+            h = (t // 2) % 24
+            m = (t % 2) * 30
+            labels.append(f"{h:02d}:{m:02d}")
+        return ticks, labels
+    return np.arange(len(time_like)), list(map(str, time_like))
 
-    df = pd.read_csv(args.csv_path, parse_dates=[args.date_col])
-    days, day_ts, day_vals = load_last_days(df, args.date_col, D, T)
+def read_real_csv(path):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().upper() for c in df.columns]
+    if "DATE" in df.columns:
+        df["DATE"] = pd.to_datetime(df["DATE"])
+    return df
 
-    # pick best-fit day
-    best_day, best_score, day_idx = None, float("inf"), None
-    for i,dte in enumerate(days):
-        act_p, act_l = day_vals[dte][args.usep_col].values, day_vals[dte][args.load_col].values
-        best_p = np.min([rmse(act_p, USEP[s,i,:]) for s in range(S)])
-        best_l = np.min([rmse(act_l, LOAD[s,i,:]) for s in range(S)])
-        score = best_p + best_l
-        if score < best_score: best_score, best_day, day_idx = score, dte, i
+def extract_day_series(df, the_date, T):
+    # Expect possibly multiple PERIOD rows per DATE
+    day = df[df["DATE"] == pd.to_datetime(the_date)].sort_index()
+    if "USEP" in day and "LOAD" in day and len(day) >= T:
+        usep = day["USEP"].values[:T]
+        load = day["LOAD"].values[:T]
+        return usep, load
+    # fallback: single-row daily data (not typical), tile
+    u = float(day["USEP"].iloc[0]); l = float(day["LOAD"].iloc[0])
+    return np.repeat(u, T), np.repeat(l, T)
 
-    ts = day_ts[best_day]
-    act_p, act_l = day_vals[best_day][args.usep_col].values, day_vals[best_day][args.load_col].values
-    p_order,p_scores = rank_scenarios(act_p, USEP[:,day_idx,:])
-    l_order,l_scores = rank_scenarios(act_l, LOAD[:,day_idx,:])
-    K = min(args.top_k, S)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--samples", required=True)
+    ap.add_argument("--real", required=True)
+    ap.add_argument("--outdir", default="figs_eval")
+    ap.add_argument("--dpi", type=int, default=140)
+    args = ap.parse_args()
 
-    # Save CSV ranking
-    outcsv = "outputs/topK_bestfit_summary.csv"
-    pd.DataFrame({
-        "var":["USEP"]*K,"day":[best_day]*K,
-        "scenario":p_order[:K],"rmse":p_scores[p_order[:K]]
-    }).to_csv(outcsv,index=False,mode="w")
-    pd.DataFrame({
-        "var":["LOAD"]*K,"day":[best_day]*K,
-        "scenario":l_order[:K],"rmse":l_scores[l_order[:K]]
-    }).to_csv(outcsv,index=False,header=False,mode="a")
-    print(f"Wrote ranking to {outcsv}")
+    os.makedirs(args.outdir, exist_ok=True)
 
-    # overlay top-K combined
-    for name,data,act,order,ylabel in [
-        ("USEP",USEP,act_p,p_order,"USEP (SGD/MWh)"),
-        ("LOAD",LOAD,act_l,l_order,"LOAD (MW)")
-    ]:
-        fig,ax=plt.subplots(figsize=(14,6))
-        for s in order[:K]: ax.plot(ts,data[s,day_idx,:],alpha=0.6)
-        ax.plot(ts,act,color="k",lw=2.5,label=f"Actual {name}")
-        ax.plot(ts,data[order[0],day_idx,:],lw=2.2)
-        ax.set_title(f"{name} — Actual vs Top-{K} closest | {best_day}")
-        ax.set_xlabel("Time"); ax.set_ylabel(ylabel)
-        format_time_axis(ax); ax.legend(); fig.tight_layout()
-        fig.savefig(f"outputs/figs/bestfit_{name}_top{K}_{best_day}.png",dpi=150)
+    S = load_samples(args.samples)
+    dates = pd.to_datetime(S["dates"])
+    time_axis = S["time"]
+    usep_samps = np.asarray(S["usep_samples"])   # [D,S,T]
+    load_samps = np.asarray(S["load_samples"])   # [D,S,T]
+    D, S_, T = usep_samps.shape
+
+    df_real = read_real_csv(args.real)
+    xticks, xlabels = normalize_time_axis(time_axis)
+
+    # aggregate metrics
+    rows = []
+    for d_idx, day in enumerate(dates):
+        usep_day = usep_samps[d_idx]        # [S,T]
+        load_day = load_samps[d_idx]        # [S,T]
+        usep_p10 = np.percentile(usep_day, 10, axis=0)
+        usep_p50 = np.percentile(usep_day, 50, axis=0)
+        usep_p90 = np.percentile(usep_day, 90, axis=0)
+        load_p10 = np.percentile(load_day, 10, axis=0)
+        load_p50 = np.percentile(load_day, 50, axis=0)
+        load_p90 = np.percentile(load_day, 90, axis=0)
+
+        usep_real, load_real = extract_day_series(df_real, day, T)
+
+        # Metrics
+        es_usep = energy_score(usep_day, usep_real)
+        es_load = energy_score(load_day, load_real)
+        cov_usep = np.mean((usep_p10 <= usep_real) & (usep_real <= usep_p90))
+        cov_load = np.mean((load_p10 <= load_real) & (load_real <= load_p90))
+        rmse_usep = np.sqrt(np.mean((usep_p50 - usep_real) ** 2))
+        rmse_load = np.sqrt(np.mean((load_p50 - load_real) ** 2))
+
+        rows.append({
+            "date": day.date(),
+            "ES_USEP": es_usep, "COV_USEP": cov_usep, "RMSE_MED_USEP": rmse_usep,
+            "ES_LOAD": es_load, "COV_LOAD": cov_load, "RMSE_MED_LOAD": rmse_load
+        })
+
+        # ---- Plot USEP
+        fig, ax = plt.subplots()
+        ax.fill_between(xticks, usep_p10, usep_p90, alpha=0.25, label="P10–P90")
+        ax.plot(xticks, usep_p50, lw=2, label="Median")
+        ax.plot(xticks, usep_real, lw=3, color="k", label="Actual")
+        ax.set_title(f"USEP — Scenarios vs Actual | {day.date()}")
+        ax.set_ylabel("USEP (SGD/MWh)")
+        ax.set_xticks(xticks[::4]); ax.set_xticklabels(xlabels[::4], rotation=0)
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.outdir, f"usep_{day.date()}.png"), dpi=args.dpi)
         plt.close(fig)
 
-        # now individual top-5 plots
-        for j,s in enumerate(order[:args.individual_k]):
-            fig,ax=plt.subplots(figsize=(14,6))
-            ax.plot(ts,act,color="k",lw=2.5,label="Actual")
-            ax.plot(ts,data[s,day_idx,:],lw=2,label=f"Scenario {s}")
-            ax.set_title(f"{name} — Scenario {s} vs Actual | {best_day}")
-            ax.set_xlabel("Time"); ax.set_ylabel(ylabel)
-            format_time_axis(ax); ax.legend(); fig.tight_layout()
-            fname=f"outputs/figs/bestfit_{name}_scenario_{j}_{best_day}.png"
-            fig.savefig(fname,dpi=150); plt.close(fig)
+        # ---- Plot LOAD
+        fig, ax = plt.subplots()
+        ax.fill_between(xticks, load_p10, load_p90, alpha=0.25, label="P10–P90")
+        ax.plot(xticks, load_p50, lw=2, label="Median")
+        ax.plot(xticks, load_real, lw=3, color="k", label="Actual")
+        ax.set_title(f"LOAD — Scenarios vs Actual | {day.date()}")
+        ax.set_ylabel("LOAD (MW)")
+        ax.set_xticks(xticks[::4]); ax.set_xticklabels(xlabels[::4], rotation=0)
+        ax.legend(loc="upper left")
+        fig.tight_layout()
+        fig.savefig(os.path.join(args.outdir, f"load_{day.date()}.png"), dpi=args.dpi)
+        plt.close(fig)
 
-    print(f"Saved top-{K} overlays and top-{args.individual_k} individual scenario images.")
-    print(f"Best-fit day: {best_day}")
+    # Save metrics CSV
+    pd.DataFrame(rows).to_csv(os.path.join(args.outdir, "metrics_summary.csv"), index=False)
+    print(f"[OK] Wrote figures and metrics to {args.outdir}")
 
-if __name__=="__main__":
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--scenarios",default="outputs/samples_pt.pkl")
-    ap.add_argument("--csv_path",default="~/Real_usep_load_pv_rp.csv")
-    ap.add_argument("--date_col",default="DATE")
-    ap.add_argument("--usep_col",default="USEP")
-    ap.add_argument("--load_col",default="LOAD")
-    ap.add_argument("--top_k",type=int,default=15)
-    ap.add_argument("--individual_k",type=int,default=5)
-    args=ap.parse_args()
-    args.csv_path=os.path.expanduser(args.csv_path)
-    args.scenarios=os.path.expanduser(args.scenarios)
-    main(args)
-
+if __name__ == "__main__":
+    main()

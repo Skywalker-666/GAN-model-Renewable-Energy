@@ -1,82 +1,92 @@
-import os
-import argparse
-import pickle
+# sample.py
+import os, argparse, pickle
 import numpy as np
 import pandas as pd
 import torch
 
-from utils import make_time_features, build_sequences
-from model import Generator, Critic
+from utils import (
+    read_energy_csv, make_daily_tensors, RobustScaler1D,
+    expm1_signed, build_time_condition, stack_condition_with_exogenous
+)
+from model import Generator
 
+@torch.no_grad()
+def sample(args):
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
 
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load checkpoint hyperparams
+    # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device)
-    seq_len = int(ckpt["seq_len"])
-    z_dim   = int(ckpt["z_dim"])
-    hidden  = int(ckpt["hidden"])
+    cfg = ckpt["cfg"]
+    usep_scaler = RobustScaler1D.from_dict(ckpt["usep_scaler"])
+    load_scaler = RobustScaler1D.from_dict(ckpt["load_scaler"])
 
-    # Build time features and get scalers/columns via build_sequences (but DO NOT slice from X_c)
-    df = pd.read_csv(args.data_path)
-    df = make_time_features(df, "DATE")
-    X_c, Y, y_scaler, c_scaler, cov_cols = build_sequences(df, seq_len=seq_len, use_covariates=True)
+    cond_ch = 6 + (1 if cfg.get("use_pv", True) else 0) + (1 if cfg.get("use_rp", True) else 0)
+    G = Generator(z_dim=cfg["z_dim"], cond_ch=cond_ch, hidden=cfg["hidden"], out_ch=2).to(device)
+    G.load_state_dict(ckpt["G_ema"])  # use EMA for inference
+    G.eval()
 
-    # Correct way: slice from the flat covariates, then reshape to [n_days, F, T]
-    total_steps = args.n_days * seq_len
-    c_raw = df[cov_cols].values                          # [N_total, F]
-    c_scaled = c_scaler.transform(c_raw)                 # standardize using same scaler as training
-    if total_steps > len(c_scaled):
-        raise ValueError(
-            f"Requested n_days*seq_len={total_steps}, but only {len(c_scaled)} rows available. "
-            f"Reduce --n_days or provide a longer CSV."
-        )
-    tail = c_scaled[-total_steps:]                       # [total_steps, F]
-    cond_block = tail.reshape(args.n_days, seq_len, -1)  # [n_days, T, F]
-    cond_block = np.swapaxes(cond_block, 1, 2)           # [n_days, F, T]
-    cond = torch.from_numpy(cond_block).float().to(device)
+    # Prepare days to sample
+    df = read_energy_csv(args.data_path)
+    dates, times, _, _, x_pv, x_rp = make_daily_tensors(df, seq_len=args.seq_len, use_rp=cfg.get("use_rp", True))
+    if args.start or args.end:
+        mask = np.ones(len(dates), dtype=bool)
+        if args.start:
+            mask &= dates >= pd.to_datetime(args.start)
+        if args.end:
+            mask &= dates <= pd.to_datetime(args.end)
+        dates = dates[mask]; times = [times[i] for i in np.where(mask)[0]]
+        x_pv = x_pv[mask]; x_rp = (x_rp[mask] if x_rp is not None else None)
 
-    # Build generator consistent with checkpoint
-    gen = Generator(z_dim=z_dim, cond_ch=cond.shape[1], out_ch=2, hidden=hidden).to(device)
-    gen.load_state_dict(ckpt["gen"])
-    gen.eval()
+    D = len(dates); T = args.seq_len; S = args.n_samples
+    usep_samples = np.zeros((D, S, T), dtype=float)
+    load_samples = np.zeros((D, S, T), dtype=float)
 
-    all_samples = []
-    with torch.no_grad():
-        # Prepare scaler tensors for inverse transform (to real units)
-        y_mean = torch.tensor(ckpt["y_scaler_mean"], device=device).view(1, 2, 1)
-        y_scale = torch.tensor(ckpt["y_scaler_scale"], device=device).view(1, 2, 1)
+    for i in range(D):
+        cond_t = build_time_condition(times[i])
+        cond = stack_condition_with_exogenous(cond_t,
+                                              pv=x_pv[i] if cfg.get("use_pv", True) else None,
+                                              rp=(x_rp[i] if (x_rp is not None and cfg.get("use_rp", True)) else None))
+        cond = torch.from_numpy(cond).float().to(device)[None, ...]  # [1,F,T]
+        z = torch.randn(S, cfg["z_dim"], T, device=device)
+        cond_rep = cond.repeat(S, 1, 1)
+        y = G(z, cond_rep).cpu().numpy()  # [S,2,T]
 
-        for _ in range(args.n_samples):
-            z = torch.randn(args.n_days, z_dim, seq_len, device=device)   # [n_days, z_dim, T]
-            y_hat = gen(z, cond)                                          # [n_days, 2, T]
-            y_hat = y_hat * y_scale + y_mean                              # de-standardize
-            all_samples.append(y_hat.cpu().numpy())
+        # Invert scaling
+        usep_hat = expm1_signed(usep_scaler.inverse_transform(y[:, 0, :]))
+        load_hat = load_scaler.inverse_transform(y[:, 1, :])
 
-    all_samples = np.stack(all_samples)  # [S, n_days, 2, T]
+        usep_samples[i] = usep_hat
+        load_samples[i] = load_hat
 
-    os.makedirs("outputs", exist_ok=True)
-    out_path = "outputs/samples_pt.pkl"
-    with open(out_path, "wb") as f:
-        pickle.dump(
-            {
-                "samples": all_samples,
-                "scaled": False,                 # real units now
-                "seq_len": seq_len,
-                "targets": ["USEP", "LOAD"],
-            },
-            f,
-        )
-    print("Saved samples to", out_path)
+    os.makedirs(args.outdir, exist_ok=True)
+    out_npz = os.path.join(args.outdir, "samples.npz")
+    np.savez_compressed(out_npz,
+                        dates=np.array([pd.Timestamp(d).strftime("%Y-%m-%d") for d in dates]),
+                        time=np.arange(T),
+                        usep_samples=usep_samples,
+                        load_samples=load_samples)
+    print(f"[OK] Saved scenarios to {out_npz}")
 
+    # Optional quick-look CSV of daily medians
+    med = {
+        "DATE": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in dates],
+        "USEP_MEDIAN_0": usep_samples[:, :, 0].median(axis=1),
+        "LOAD_MEDIAN_0": load_samples[:, :, 0].median(axis=1),
+    }
+    pd.DataFrame(med).to_csv(os.path.join(args.outdir, "quick_medians.csv"), index=False)
+
+def cli():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--data_path", required=True)
+    ap.add_argument("--outdir", default="outputs")
+    ap.add_argument("--seq_len", type=int, default=48)
+    ap.add_argument("--n_samples", type=int, default=200)
+    ap.add_argument("--start", default=None)
+    ap.add_argument("--end", default=None)
+    ap.add_argument("--cpu", action="store_true")
+    args = ap.parse_args()
+    sample(args)
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--data_path", type=str, required=True)
-    p.add_argument("--seq_len", type=int, default=48)  # kept for CLI parity; actual seq_len comes from ckpt
-    p.add_argument("--n_days", type=int, default=7)
-    p.add_argument("--n_samples", type=int, default=100)
-    args = p.parse_args()
-    main(args)
+    cli()
