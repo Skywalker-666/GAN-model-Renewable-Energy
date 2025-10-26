@@ -67,11 +67,11 @@ def sample(args):
                         load_samples=load_samples)
     print(f"[OK] Saved scenarios to {out_npz}")
 
-    # Optional quick-look CSV of daily medians
+    # Optional quick-look CSV of daily medians  ✅ NumPy 2.x safe
     med = {
         "DATE": [pd.Timestamp(d).strftime("%Y-%m-%d") for d in dates],
-        "USEP_MEDIAN_0": usep_samples[:, :, 0].median(axis=1),
-        "LOAD_MEDIAN_0": load_samples[:, :, 0].median(axis=1),
+        "USEP_MEDIAN_0": np.median(usep_samples[:, :, 0], axis=1),
+        "LOAD_MEDIAN_0": np.median(load_samples[:, :, 0], axis=1),
     }
     pd.DataFrame(med).to_csv(os.path.join(args.outdir, "quick_medians.csv"), index=False)
 
