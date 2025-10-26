@@ -87,15 +87,17 @@ def stack_condition_with_exogenous(cond_time, pv=None, rp=None):
 # Data handling (daily windows)
 # -----------------------------
 def read_energy_csv(path):
-    """
-    Expected columns (case-insensitive):
-      DATE (datetime), PERIOD (optional int 1..48), USEP, LOAD, PV (optional), RP (optional)
-    """
+    import pandas as pd
     df = pd.read_csv(path)
     df.columns = [c.strip().upper() for c in df.columns]
-    if "DATE" not in df.columns: raise ValueError("CSV must contain a DATE column")
-    df["DATE"] = pd.to_datetime(df["DATE"])
-    # sort by date, then period if present
+
+    # Ensure DATE column is parsed and normalized to midnight
+    if "DATE" not in df.columns:
+        raise ValueError("CSV must contain a DATE column")
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df["DATE"] = df["DATE"].dt.normalize()   # ✅ key fix
+
+    # Sort by DATE and PERIOD if present
     if "PERIOD" in df.columns:
         df = df.sort_values(["DATE", "PERIOD"])
     else:
