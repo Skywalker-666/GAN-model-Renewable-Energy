@@ -1,83 +1,170 @@
-import numpy as np, pandas as pd
+# utils.py
+import numpy as np
+import pandas as pd
 import torch
 
-# ------------------ Scaling helpers ------------------
+# -----------------------------
+# Repro + small helpers
+# -----------------------------
+def set_seed(seed: int = 42):
+    import random, os
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+@torch.no_grad()
+def ema_update(target, source, decay=0.999):
+    for p_t, p in zip(target.parameters(), source.parameters()):
+        p_t.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
+
+# -----------------------------
+# Scaling for heavy-tailed series
+# -----------------------------
 class RobustScaler1D:
-    def fit(self, X):
-        X = np.asarray(X, dtype=float)
-        self.med = np.nanmedian(X)
-        self.mad = np.nanmedian(np.abs(X - self.med)) + 1e-6
+    """MAD-based robust scaler (works well for energy price tails)."""
+    def fit(self, x):
+        x = np.asarray(x).astype(float)
+        self.med = float(np.nanmedian(x))
+        self.mad = float(np.nanmedian(np.abs(x - self.med)) + 1e-6)
         return self
-    def transform(self, X):
-        return (np.asarray(X, dtype=float) - self.med) / (1.4826 * self.mad)
-    def inverse_transform(self, X):
-        X = np.asarray(X, dtype=float)
-        return X * (1.4826 * self.mad) + self.med
-    def to_dict(self): return {"med": self.med, "mad": self.mad}
+    def transform(self, x):
+        return (np.asarray(x).astype(float) - self.med) / (1.4826 * self.mad)
+    def inverse_transform(self, x):
+        return np.asarray(x).astype(float) * (1.4826 * self.mad) + self.med
+    def to_dict(self):
+        return {"med": self.med, "mad": self.mad}
     @classmethod
     def from_dict(cls, d):
-        o = cls(); o.med = d["med"]; o.mad = d["mad"]; return o
+        if d is None:
+            return None
+        obj = cls()
+        obj.med, obj.mad = float(d["med"]), float(d["mad"])
+        return obj
 
-class RobustScalerVec:
-    """Channel-wise robust scaler for 2D features."""
-    def fit(self, X):
-        X = np.asarray(X, dtype=float)
-        self.med = np.nanmedian(X, axis=0)
-        self.mad = np.nanmedian(np.abs(X - self.med), axis=0) + 1e-6
-        return self
-    def transform(self, X):
-        X = np.asarray(X, dtype=float)
-        return (X - self.med) / (1.4826 * self.mad)
-    def inverse_transform(self, X):
-        X = np.asarray(X, dtype=float)
-        return X * (1.4826 * self.mad) + self.med
-    def to_dict(self): return {"med": self.med.tolist(), "mad": self.mad.tolist()}
-    @classmethod
-    def from_dict(cls, d):
-        o = cls(); o.med = np.array(d["med"]); o.mad = np.array(d["mad"]); return o
+def log1p_signed(x):
+    x = np.asarray(x).astype(float)
+    return np.sign(x) * np.log1p(np.abs(x))
 
-# ------------------ CSV Reading ------------------
+def expm1_signed(x):
+    x = np.asarray(x).astype(float)
+    return np.sign(x) * (np.expm1(np.abs(x)))
+
+# ---- NEW: convenience for exogenous scaling ----
+def transform_exo_for_model(x, fit_scaler=None, do_log1p=False):
+    """
+    x: array-like [D,T] or [T]
+    If fit_scaler is None -> fit a new RobustScaler1D on (optionally) log1p-signed(x)
+    Returns (x_transformed, scaler_used)
+    """
+    x = np.asarray(x, dtype=float)
+    x_work = log1p_signed(x) if do_log1p else x
+    scaler = fit_scaler or RobustScaler1D().fit(x_work)
+    return scaler.transform(x_work), scaler
+
+# -----------------------------
+# Conditioning builders
+# -----------------------------
+def _sin_cos(series, period):
+    x = 2.0 * np.pi * (np.asarray(series).astype(float) / period)
+    return np.stack([np.sin(x), np.cos(x)], axis=0)  # [2, T]
+
+def build_time_condition(index_like):
+    """
+    index_like: Pandas DatetimeIndex (length T).
+    Returns cond_time: [6, T]  (hour sin/cos, weekday sin/cos, month sin/cos)
+    """
+    idx = pd.DatetimeIndex(index_like)
+    hour = idx.hour + idx.minute / 60.0
+    dow = idx.dayofweek
+    mon = idx.month
+    return np.concatenate([_sin_cos(hour, 24), _sin_cos(dow, 7), _sin_cos(mon, 12)], axis=0)
+
+def stack_condition_with_exogenous(cond_time, pv=None, rp=None):
+    """
+    cond_time: [6, T]
+    pv, rp: arrays length T (optional, already transformed for the model)
+    Returns [F, T]
+    """
+    exo = []
+    if pv is not None:
+        exo.append(np.asarray(pv, dtype=float)[None, :])
+    if rp is not None:
+        exo.append(np.asarray(rp, dtype=float)[None, :])
+    if exo:
+        exo = np.concatenate(exo, axis=0)
+        return np.concatenate([cond_time, exo], axis=0)
+    return cond_time
+
+# -----------------------------
+# Data handling (daily windows)
+# -----------------------------
 def read_energy_csv(path):
+    import pandas as pd
     df = pd.read_csv(path)
     df.columns = [c.strip().upper() for c in df.columns]
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce").dt.normalize()
+
+    # Ensure DATE column is parsed and normalized to midnight
+    if "DATE" not in df.columns:
+        raise ValueError("CSV must contain a DATE column")
+    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    df["DATE"] = df["DATE"].dt.normalize()   # ✅ key fix
+
+    # Sort by DATE and PERIOD if present
     if "PERIOD" in df.columns:
         df = df.sort_values(["DATE", "PERIOD"])
     else:
         df = df.sort_values(["DATE"])
     return df
 
-# ------------------ Torch utils ------------------
-def build_time_condition(times):
-    """Create sin/cos time-of-day encoding"""
-    times = np.asarray(times)
-    sin_t = np.sin(2 * np.pi * times / 48)
-    cos_t = np.cos(2 * np.pi * times / 48)
-    return np.stack([sin_t, cos_t], axis=1)
+def make_daily_tensors(df, seq_len=48, use_rp=True):
+    """
+    Groups the dataframe by DATE and returns arrays per day.
+    Returns:
+      dates: [D] array of dates
+      time_index_per_day: list of DatetimeIndex for each day (length T)
+      y_usep: [D, T], y_load: [D, T]
+      x_pv: [D, T] (or None), x_rp: [D, T] (or None)
+    """
+    out_dates, time_index = [], []
+    ys_usep, ys_load, xs_pv, xs_rp = [], [], [], []
+    g = df.groupby("DATE")
+    for d, sub in g:
+        if len(sub) < seq_len:  # skip incomplete days
+            continue
+        sub = sub.head(seq_len).copy()
+        # Timestamp for each period (build if not present)
+        if "PERIOD" in sub.columns:
+            base = pd.Timestamp(pd.Timestamp(d).normalize())
+            times = [base + pd.Timedelta(minutes=30 * int(p - 1)) for p in sub["PERIOD"].values]
+        else:
+            base = pd.Timestamp(pd.Timestamp(d).normalize())
+            times = [base + pd.Timedelta(minutes=30 * i) for i in range(seq_len)]
+        out_dates.append(pd.Timestamp(d))
+        time_index.append(pd.DatetimeIndex(times))
+        ys_usep.append(sub["USEP"].values[:seq_len].astype(float))
+        ys_load.append(sub["LOAD"].values[:seq_len].astype(float))
+        xs_pv.append(sub["PV"].values[:seq_len].astype(float) if "PV" in sub.columns else np.zeros(seq_len))
+        if use_rp:
+            xs_rp.append(sub["RP"].values[:seq_len].astype(float) if "RP" in sub.columns else np.zeros(seq_len))
+    D = len(out_dates)
+    y_usep = np.stack(ys_usep, axis=0) if D else np.empty((0, seq_len))
+    y_load = np.stack(ys_load, axis=0) if D else np.empty((0, seq_len))
+    x_pv   = np.stack(xs_pv,   axis=0) if D else np.empty((0, seq_len))
+    x_rp   = np.stack(xs_rp,   axis=0) if (D and use_rp) else None
+    return np.array(out_dates), time_index, y_usep, y_load, x_pv, x_rp
 
-def stack_condition_with_exogenous(cond_t, pv=None, rp=None):
-    comps = [cond_t]
-    if pv is not None: comps.append(pv[:, None])
-    if rp is not None: comps.append(rp[:, None])
-    return np.concatenate(comps, axis=1)
+# -----------------------------
+# Metrics (for validation)
+# -----------------------------
+def rmse(yhat, y):
+    return float(np.sqrt(np.mean((np.asarray(yhat) - np.asarray(y)) ** 2)))
 
-# ------------------ Torch Dataset ------------------
-class DayDataset(torch.utils.data.Dataset):
-    def __init__(self, dates, times, usep, load, pv, rp, seq_len):
-        self.dates, self.times = dates, times
-        self.usep, self.load, self.pv, self.rp = usep, load, pv, rp
-        self.seq_len = seq_len
-
-    def __len__(self): return len(self.dates)
-
-    def __getitem__(self, i):
-        y = np.stack([self.usep[i], self.load[i]], axis=0)  # [2,T]
-        cond_t = build_time_condition(self.times[i])
-        cond = stack_condition_with_exogenous(
-            cond_t,
-            pv=self.pv[i] if self.pv is not None else None,
-            rp=self.rp[i] if self.rp is not None else None
-        )
-        y = torch.tensor(y, dtype=torch.float32)
-        cond = torch.tensor(cond.T, dtype=torch.float32)
-        return y, cond
+def energy_score(samples, y):
+    s = np.asarray(samples)  # [S,T]
+    y = np.asarray(y)        # [T]
+    term1 = np.mean(np.sqrt(np.sum((s - y[None, :]) ** 2, axis=1)))
+    diffs = s[:, None, :] - s[None, :, :]
+    term2 = 0.5 * np.mean(np.sqrt(np.sum(diffs ** 2, axis=2)))
+    return float(term1 - term2)

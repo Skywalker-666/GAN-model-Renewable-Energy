@@ -1,76 +1,84 @@
+# model.py
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.nn.utils import spectral_norm as SN
 
-# ------------------------------
-# FiLM modulation
-# ------------------------------
+# ---------- Blocks ----------
 class FiLM(nn.Module):
-    def __init__(self, cond_dim, num_features):
+    """Feature-wise linear modulation from condition channels."""
+    def __init__(self, cond_ch, hidden):
         super().__init__()
-        self.scale = nn.Linear(cond_dim, num_features)
-        self.shift = nn.Linear(cond_dim, num_features)
+        self.affine = nn.Conv1d(cond_ch, hidden * 2, 1)
 
-    def forward(self, x, cond):
-        # x: [B, C, T], cond: [B, cond_dim]
-        gamma = self.scale(cond).unsqueeze(-1)
-        beta = self.shift(cond).unsqueeze(-1)
-        return gamma * x + beta
+    def forward(self, h, cond):
+        # h: [B,H,T], cond: [B,F,T]
+        gamma_beta = self.affine(cond)
+        H = h.size(1)
+        gamma, beta = gamma_beta[:, :H], gamma_beta[:, H:]
+        return h * (1 + gamma) + beta
 
-# ------------------------------
-# Residual Block for temporal conv
-# ------------------------------
-class ResBlock1D(nn.Module):
-    def __init__(self, ch, k=3):
+class ResBlock(nn.Module):
+    def __init__(self, ch, dilation):
         super().__init__()
-        pad = k // 2
-        self.net = nn.Sequential(
-            nn.Conv1d(ch, ch, k, padding=pad),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Conv1d(ch, ch, k, padding=pad),
+        pad = dilation
+        self.main = nn.Sequential(
+            nn.Conv1d(ch, ch, 3, padding=pad, dilation=dilation),
+            nn.GELU(),
+            nn.Conv1d(ch, ch, 3, padding=pad, dilation=dilation),
         )
+        self.skip = nn.Conv1d(ch, ch, 1)
+        self.act = nn.GELU()
 
     def forward(self, x):
-        return x + self.net(x)
+        return self.act(self.main(x) + self.skip(x))
 
-# ------------------------------
-# Generator
-# ------------------------------
+# ---------- Generator / Critic ----------
 class Generator(nn.Module):
-    def __init__(self, z_dim, cond_dim, hidden=128, out_ch=2, seq_len=48):
+    """
+    Input:
+        z:    [B, z_dim, T]
+        cond: [B, F, T]
+    Output:
+        y: [B, 2, T]  (channel 0 = USEP, 1 = LOAD)
+    """
+    def __init__(self, z_dim=16, cond_ch=8, hidden=128, out_ch=2):
         super().__init__()
         self.inp = nn.Conv1d(z_dim, hidden, 1)
-        self.film = FiLM(cond_dim, hidden)
+        self.film = FiLM(cond_ch, hidden)
         self.tcn = nn.Sequential(
-            ResBlock1D(hidden),
-            ResBlock1D(hidden),
-            ResBlock1D(hidden),
+            ResBlock(hidden, 1),
+            ResBlock(hidden, 2),
+            ResBlock(hidden, 4),
+            ResBlock(hidden, 8),
         )
         self.out = nn.Conv1d(hidden, out_ch, 1)
-        self.zskip = nn.Conv1d(z_dim, out_ch, 1)  # <== ensure noise matters
 
     def forward(self, z, cond):
         h = self.inp(z)
         h = self.film(h, cond)
         h = self.tcn(h)
-        return self.out(h) + self.zskip(z)
+        return self.out(h)
 
-# ------------------------------
-# Critic (Discriminator)
-# ------------------------------
 class Critic(nn.Module):
-    def __init__(self, in_ch=2, cond_dim=8, hidden=128):
+    """
+    Input:
+        x:    [B, 2, T] (USEP, LOAD)
+        cond: [B, F, T]
+    Output:
+        score: [B, 1]
+    """
+    def __init__(self, cond_ch=8, in_ch=2, hidden=128):
         super().__init__()
-        self.film = FiLM(cond_dim, hidden)
-        self.net = nn.Sequential(
-            nn.Conv1d(in_ch, hidden, 3, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            ResBlock1D(hidden),
-            ResBlock1D(hidden),
-            nn.Conv1d(hidden, 1, 1)
+        ch = in_ch + cond_ch
+        self.conv = nn.Sequential(
+            SN(nn.Conv1d(ch, hidden, 3, padding=1)), nn.LeakyReLU(0.2),
+            SN(nn.Conv1d(hidden, hidden, 3, padding=1)), nn.LeakyReLU(0.2),
+            SN(nn.Conv1d(hidden, hidden, 3, padding=1)), nn.LeakyReLU(0.2),
         )
+        self.head = SN(nn.Conv1d(hidden, 1, 1))
 
-    def forward(self, y, cond):
-        # y: [B, in_ch, T]
-        h = self.film(self.net[0](y), cond)
-        return self.net[1:](h).mean(dim=(1, 2))
+    def forward(self, x, cond):
+        h = torch.cat([x, cond], dim=1)
+        h = self.conv(h)
+        s = self.head(h).mean(dim=2, keepdim=True)  # average over time
+        return s
