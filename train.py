@@ -1,148 +1,93 @@
-# train.py
-import os, argparse, pickle
-import numpy as np
-import torch, torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-from utils import (
-    set_seed, read_energy_csv, make_daily_tensors, RobustScaler1D,
-    log1p_signed, expm1_signed, build_time_condition, stack_condition_with_exogenous,
-    ema_update
-)
+import os, torch, argparse
+import numpy as np, pandas as pd
+from torch import nn, optim
+from torch.utils.data import DataLoader
 from model import Generator, Critic
+from utils import *
 
-# -----------------------------
-# Dataset
-# -----------------------------
-class DayDataset(Dataset):
-    def __init__(self, dates, times, usep, load, pv, rp, seq_len=48):
-        self.dates, self.times = dates, times
-        self.usep, self.load = usep, load
-        self.pv, self.rp = pv, rp
-        self.seq_len = seq_len
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def __len__(self):
-        return len(self.dates)
-
-    def __getitem__(self, i):
-        T = self.seq_len
-        # targets
-        y = np.stack([self.usep[i], self.load[i]], axis=0)  # [2, T]
-        # build conditioning [F, T]
-        cond_t = build_time_condition(self.times[i])        # [6, T]
-        cond = stack_condition_with_exogenous(cond_t, pv=self.pv[i], rp=(self.rp[i] if self.rp is not None else None))
-        return (
-            torch.from_numpy(y).float(),       # [2,T]
-            torch.from_numpy(cond).float(),    # [F,T]
-            str(self.dates[i].date())
-        )
-
-# -----------------------------
-# Training loop
-# -----------------------------
+# ------------------ TRAIN FUNCTION ------------------
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    set_seed(args.seed)
-
     df = read_energy_csv(args.data_path)
-    dates, times, y_usep, y_load, x_pv, x_rp = make_daily_tensors(df, seq_len=args.seq_len, use_rp=args.use_rp)
-    assert len(dates) > 0, "No complete days found."
+    dates = sorted(df["DATE"].unique())
+    days = [df[df["DATE"] == d] for d in dates]
 
-    # Train/Val split by last val_days
-    if args.val_days > 0:
-        train_idx = np.arange(0, len(dates) - args.val_days)
-        val_idx   = np.arange(len(dates) - args.val_days, len(dates))
-    else:
-        train_idx = np.arange(len(dates)); val_idx = np.array([], dtype=int)
+    # Prepare arrays
+    usep = np.stack([d["USEP"].values for d in days])
+    load = np.stack([d["LOAD"].values for d in days])
+    pv   = np.stack([d["PV"].values for d in days]) if args.use_pv else None
+    rp   = np.stack([d["RP"].values for d in days]) if args.use_rp else None
+    times = [np.arange(args.seq_len) for _ in days]
 
-    # Fit scalers (on train only)
-    usep_scaler = RobustScaler1D().fit(log1p_signed(y_usep[train_idx]))
-    load_scaler = RobustScaler1D().fit(y_load[train_idx])
+    # Robust scalers
+    usep_scaler = RobustScaler1D().fit(usep)
+    load_scaler = RobustScaler1D().fit(load)
+    usep_t = usep_scaler.transform(usep)
+    load_t = load_scaler.transform(load)
 
-    # Transform
-    y_usep_t = usep_scaler.transform(log1p_signed(y_usep))
-    y_load_t = load_scaler.transform(y_load)
+    pv_scaler = RobustScalerVec().fit(pv) if pv is not None else None
+    rp_scaler = RobustScalerVec().fit(rp) if rp is not None else None
+    pv_t = pv_scaler.transform(pv) if pv is not None else pv
+    rp_t = rp_scaler.transform(rp) if rp is not None else rp
 
-    # Datasets
+    # Split
+    n = len(dates)
+    train_idx = np.arange(0, n - args.val_days)
+    val_idx = np.arange(n - args.val_days, n)
+
     train_ds = DayDataset(dates[train_idx], [times[i] for i in train_idx],
-                          y_usep_t[train_idx], y_load_t[train_idx],
-                          x_pv[train_idx], (x_rp[train_idx] if x_rp is not None else None),
+                          usep_t[train_idx], load_t[train_idx],
+                          pv_t[train_idx] if pv_t is not None else None,
+                          rp_t[train_idx] if rp_t is not None else None,
                           seq_len=args.seq_len)
-    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True)
 
-    val_ds = None
-    if len(val_idx):
-        val_ds = DayDataset(dates[val_idx], [times[i] for i in val_idx],
-                            y_usep_t[val_idx], y_load_t[val_idx],
-                            x_pv[val_idx], (x_rp[val_idx] if x_rp is not None else None),
-                            seq_len=args.seq_len)
+    # Models
+    cond_dim = train_ds[0][1].shape[0]
+    G = Generator(args.z_dim, cond_dim, hidden=args.hidden).to(device)
+    D = Critic(in_ch=2, cond_dim=cond_dim, hidden=args.hidden).to(device)
 
-    # Model
-    cond_ch = 6 + (1 if args.use_pv else 0) + (1 if args.use_rp else 0)
-    G = Generator(z_dim=args.z_dim, cond_ch=cond_ch, hidden=args.hidden, out_ch=2).to(device)
-    D = Critic(cond_ch=cond_ch, in_ch=2, hidden=args.hidden).to(device)
-    G_ema = Generator(z_dim=args.z_dim, cond_ch=cond_ch, hidden=args.hidden, out_ch=2).to(device)
+    opt_G = optim.Adam(G.parameters(), lr=args.lrG, betas=(0.5, 0.9))
+    opt_D = optim.Adam(D.parameters(), lr=args.lrD, betas=(0.5, 0.9))
+
+    # EMA
+    G_ema = Generator(args.z_dim, cond_dim, hidden=args.hidden).to(device)
     G_ema.load_state_dict(G.state_dict())
 
-    # Optims (TTUR)
-    optG = torch.optim.Adam(G.parameters(), lr=args.lrG, betas=(0.0, 0.9))
-    optD = torch.optim.Adam(D.parameters(), lr=args.lrD, betas=(0.0, 0.9))
+    def ema_update(target, src, decay):
+        with torch.no_grad():
+            for t, s in zip(target.parameters(), src.parameters()):
+                t.copy_(t * decay + s * (1 - decay))
 
-    huber = nn.SmoothL1Loss()
+    for epoch in range(args.epochs):
+        for y, cond in train_loader:
+            y, cond = y.to(device), cond.to(device)
 
-    step = 0
-    for epoch in range(1, args.epochs + 1):
-        G.train(); D.train()
-        for (y_real, cond, _) in train_dl:
-            y_real = y_real.to(device)               # [B,2,T]
-            cond   = cond.to(device)                 # [B,F,T]
-            B, _, T = y_real.shape
-
-            # ----------------- Critic updates -----------------
+            # --- Train Critic ---
             for _ in range(args.c_iters):
-                z = torch.randn(B, args.z_dim, T, device=device)
-                with torch.no_grad():
-                    y_fake = G(z, cond)
-                d_real = D(y_real, cond).mean()
-                d_fake = D(y_fake, cond).mean()
-                wd = d_real - d_fake
+                z = torch.randn(y.size(0), args.z_dim, args.seq_len, device=device)
+                y_fake = G(z, cond).detach()
+                d_real = D(y, cond)
+                d_fake = D(y_fake, cond)
+                gp = gradient_penalty(D, y, y_fake, cond)
+                loss_D = -(d_real.mean() - d_fake.mean()) + args.gp_lambda * gp
+                opt_D.zero_grad(); loss_D.backward(); opt_D.step()
 
-                # Gradient Penalty
-                eps = torch.rand(B, 1, 1, device=device)
-                x_hat = eps * y_real + (1 - eps) * y_fake
-                x_hat.requires_grad_(True)
-                d_hat = D(x_hat, cond).sum()
-                g = torch.autograd.grad(d_hat, x_hat, create_graph=True)[0]
-                gp = ((g.flatten(1).norm(2, dim=1) - 1) ** 2).mean()
-
-                loss_D = -wd + args.gp_lambda * gp
-                optD.zero_grad(set_to_none=True)
-                loss_D.backward()
-                optD.step()
-
-            # ----------------- Generator update -----------------
-            z = torch.randn(B, args.z_dim, T, device=device)
+            # --- Train Generator ---
+            z = torch.randn(y.size(0), args.z_dim, args.seq_len, device=device)
             y_fake = G(z, cond)
-            g_adv = -D(y_fake, cond).mean()
+            d_fake = D(y_fake, cond)
+            g_adv = -d_fake.mean()
+            loss_anchor = torch.abs(y_fake - y).mean()
+            tv = (y_fake[:,:,1:] - y_fake[:,:,:-1]).abs().mean()
+            loss_G = g_adv + args.anchor * loss_anchor + 0.001 * tv
+            opt_G.zero_grad(); loss_G.backward(); opt_G.step()
+            ema_update(G_ema, G, args.ema)
 
-            # small anchor with tiny noise
-            z_eps = 0.1 * torch.randn(B, args.z_dim, T, device=device)
-            y_anchor = G(z_eps, cond)
-            loss_anchor = huber(y_anchor, y_real)
+        print(f"[Epoch {epoch+1:03d}] D: {loss_D.item():.4f} | G: {loss_G.item():.4f}")
 
-            loss_G = g_adv + args.anchor * loss_anchor
-            optG.zero_grad(set_to_none=True)
-            loss_G.backward()
-            optG.step()
-
-            ema_update(G_ema, G, decay=args.ema)
-
-            step += 1
-
-        print(f"[Epoch {epoch:03d}] D: {loss_D.item():.4f} | G: {loss_G.item():.4f} | wd: {wd.item():.4f} | gp:{gp.item():.3f}")
-
-    # Save checkpoint (includes scalers)
-    os.makedirs(args.outdir, exist_ok=True)
+    # Save checkpoint
     ckpt = {
         "G": G.state_dict(),
         "G_ema": G_ema.state_dict(),
@@ -150,22 +95,32 @@ def train(args):
         "cfg": vars(args),
         "usep_scaler": usep_scaler.to_dict(),
         "load_scaler": load_scaler.to_dict(),
+        "pv_scaler": pv_scaler.to_dict() if pv_scaler else None,
+        "rp_scaler": rp_scaler.to_dict() if rp_scaler else None,
     }
+    os.makedirs(args.outdir, exist_ok=True)
     torch.save(ckpt, os.path.join(args.outdir, "ckpt_last.pt"))
-    print(f"[OK] Saved to {os.path.join(args.outdir, 'ckpt_last.pt')}")
+    print("[OK] Saved to", args.outdir)
 
-# -----------------------------
-# CLI
-# -----------------------------
-def cli():
+# ------------------ Gradient penalty ------------------
+def gradient_penalty(D, real, fake, cond):
+    eps = torch.rand(real.size(0), 1, 1, device=real.device)
+    inter = eps * real + (1 - eps) * fake
+    inter.requires_grad_(True)
+    out = D(inter, cond)
+    grad = torch.autograd.grad(out, inter, grad_outputs=torch.ones_like(out),
+                               create_graph=True, retain_graph=True, only_inputs=True)[0]
+    return ((grad.norm(2, dim=(1,2)) - 1) ** 2).mean()
+
+# ------------------ CLI ------------------
+if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_path", required=True)
     ap.add_argument("--outdir", default="checkpoints")
     ap.add_argument("--seq_len", type=int, default=48)
     ap.add_argument("--val_days", type=int, default=0)
-    ap.add_argument("--use_pv", action="store_true", default=True)
-    ap.add_argument("--use_rp", action="store_true", default=True)
-
+    ap.add_argument("--use_pv", action="store_true")
+    ap.add_argument("--use_rp", action="store_true")
     ap.add_argument("--z_dim", type=int, default=16)
     ap.add_argument("--hidden", type=int, default=128)
     ap.add_argument("--batch", type=int, default=128)
@@ -174,12 +129,7 @@ def cli():
     ap.add_argument("--lrD", type=float, default=2e-4)
     ap.add_argument("--c_iters", type=int, default=2)
     ap.add_argument("--gp_lambda", type=float, default=10.0)
-    ap.add_argument("--anchor", type=float, default=0.05)
+    ap.add_argument("--anchor", type=float, default=0.20)
     ap.add_argument("--ema", type=float, default=0.999)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--cpu", action="store_true")
     args = ap.parse_args()
     train(args)
-
-if __name__ == "__main__":
-    cli()
