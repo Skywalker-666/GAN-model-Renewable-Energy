@@ -70,9 +70,12 @@ def train(args):
     x_rp_t = None
 
     if args.use_pv:
-        x_pv_t, pv_scaler = transform_exo_for_model(x_pv, do_log1p=True)
+        from utils import transform_exo_for_model, log1p_signed
+        pv_train_t, pv_scaler = transform_exo_for_model(x_pv[train_idx], do_log1p=True)
+        x_pv_t, _ = transform_exo_for_model(x_pv, fit_scaler=pv_scaler, do_log1p=True)
     if args.use_rp and x_rp is not None:
-        x_rp_t, rp_scaler = transform_exo_for_model(x_rp, do_log1p=True)
+        rp_train_t, rp_scaler = transform_exo_for_model(x_rp[train_idx], do_log1p=True)
+        x_rp_t, _ = transform_exo_for_model(x_rp, fit_scaler=rp_scaler, do_log1p=True)
 
     # Transform targets
     y_usep_t = usep_scaler.transform(log1p_signed(y_usep))
